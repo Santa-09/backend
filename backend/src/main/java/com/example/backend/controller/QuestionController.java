@@ -27,6 +27,11 @@ public class QuestionController {
         return questionService.createQuestion(request.getText());
     }
 
+    @PostMapping("/{questionId}/replies")
+    public Reply addReply(@PathVariable String questionId, @RequestBody ReplyRequest request) {
+        return questionService.addReply(questionId, request.getText());
+    }
+
     @DeleteMapping("/{id}")
     public void deleteQuestion(@PathVariable String id) {
         questionService.deleteQuestion(id);
