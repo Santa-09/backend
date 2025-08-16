@@ -20,22 +20,24 @@ public class QuestionService {
         question.setId(UUID.randomUUID().toString());
         question.setText(text);
         question.setCreatedAt(LocalDateTime.now());
+        question.setReplies(new ArrayList<>()); // Initialize replies list
         questions.put(question.getId(), question);
         return question;
     }
 
-    public void deleteQuestion(String id) {
-        questions.remove(id);
-    }
-
     public Reply addReply(String questionId, String text) {
         Question question = questions.get(questionId);
-        if (question == null) return null;
+        if (question == null) throw new RuntimeException("Question not found");
+        
         Reply reply = new Reply();
         reply.setId(UUID.randomUUID().toString());
         reply.setText(text);
         question.getReplies().add(reply);
         return reply;
+    }
+
+    public void deleteQuestion(String id) {
+        questions.remove(id);
     }
 
     public void deleteReply(String questionId, String replyId) {
