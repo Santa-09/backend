@@ -1,0 +1,18 @@
+{
+  "name": "anonymous-qa-backend",
+  "version": "1.0.0",
+  "description": "Backend for Anonymous Classroom Q&A (Express + SockJS)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "sockjs": "^0.3.24",
+    "uuid": "^9.0.1"
+  }
+}
