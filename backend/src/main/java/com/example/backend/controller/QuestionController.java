@@ -47,6 +47,7 @@ public class QuestionController {
         questionService.clearAllQuestions();
     }
 
+    // Inner classes for request bodies
     public static class QuestionRequest {
         private String text;
         public String getText() { return text; }
