@@ -11,7 +11,7 @@ const server = createServer(app);
 const sockServer = sockjs.createServer();
 
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = "santanu@2006"; // secret for signing JWT tokens
+const JWT_SECRET = "santanu@2006"; // keep safe!
 const ADMIN_USERNAME = "admin";
 const ADMIN_PASSWORD = "santanu@2006";
 
@@ -24,7 +24,17 @@ let questions = []; // {id, text, createdAt, replies:[{id,text,createdAt}]}
 let adminSessions = new Set();
 let connections = new Set();
 
-// JWT middleware for admin routes
+// 🔧 Maintenance mode (global)
+let maintenanceMode = false;
+
+// ---- helpers ----
+function broadcast(message) {
+  const data = JSON.stringify(message);
+  connections.forEach((conn) => {
+    try { conn.write(data); } catch {}
+  });
+}
+
 function requireAdmin(req, res, next) {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ error: "Unauthorized" });
@@ -36,17 +46,18 @@ function requireAdmin(req, res, next) {
     }
     req.admin = decoded;
     next();
-  } catch (err) {
+  } catch {
     res.status(401).json({ error: "Invalid token" });
   }
 }
 
-// ---- SockJS setup ----
+// ---- SockJS ----
 sockServer.on("connection", (conn) => {
   connections.add(conn);
-  conn.id = uuidv4(); // assign unique ID to each member
+  conn.id = uuidv4(); // member id
 
-  conn.on("data", () => { /* no-op */ });
+  // send current maintenance state immediately
+  conn.write(JSON.stringify({ type: "maintenance", payload: { status: maintenanceMode }}));
 
   conn.on("close", () => {
     connections.delete(conn);
@@ -55,30 +66,57 @@ sockServer.on("connection", (conn) => {
 
 sockServer.installHandlers(server, { prefix: "/ws" });
 
-// ---- API Routes ----
-
-// Admin login (expects { username, password })
+// ---- Admin auth ----
 app.post("/api/admin/login", (req, res) => {
   const { username, password } = req.body;
   if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
     const sessionId = uuidv4();
     adminSessions.add(sessionId);
-    const token = jwt.sign({ username, sessionId }, JWT_SECRET, {
-      expiresIn: "1h",
-    });
+    const token = jwt.sign({ username, sessionId }, JWT_SECRET, { expiresIn: "1h" });
     res.json({ token });
   } else {
     res.status(401).json({ error: "Invalid credentials" });
   }
 });
 
-// Get all questions
+// ---- Maintenance endpoints (admin only) ----
+app.get("/api/admin/maintenance", requireAdmin, (req, res) => {
+  res.json({ status: maintenanceMode });
+});
+
+app.post("/api/admin/maintenance", requireAdmin, (req, res) => {
+  const { status } = req.body;
+  if (typeof status !== "boolean") {
+    return res.status(400).json({ error: "status must be boolean" });
+  }
+  maintenanceMode = status;
+
+  // broadcast to all clients
+  broadcast({ type: "maintenance", payload: { status: maintenanceMode } });
+  res.json({ status: maintenanceMode });
+});
+
+// ---- Members endpoints ----
+app.get("/api/members/count", (req, res) => {
+  res.json({ totalMembers: connections.size });
+});
+
+app.get("/api/admin/members", requireAdmin, (req, res) => {
+  res.json({
+    totalMembers: connections.size,
+    members: Array.from(connections).map((c) => ({ id: c.id })),
+  });
+});
+
+// ---- Questions ----
 app.get("/api/questions", (req, res) => {
   res.json(questions);
 });
 
-// Add a new question
 app.post("/api/questions", (req, res) => {
+  if (maintenanceMode) {
+    return res.status(503).json({ error: "Server under maintenance" });
+  }
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: "Text is required" });
 
@@ -89,15 +127,15 @@ app.post("/api/questions", (req, res) => {
     replies: [],
   };
   questions.push(newQuestion);
-
-  // broadcast to all connections
   broadcast({ type: "new-question", payload: newQuestion });
-
   res.json(newQuestion);
 });
 
-// Add a reply
+// ---- Replies ----
 app.post("/api/questions/:id/replies", (req, res) => {
+  if (maintenanceMode) {
+    return res.status(503).json({ error: "Server under maintenance" });
+  }
   const { text } = req.body;
   const question = questions.find((q) => q.id === req.params.id);
   if (!question) return res.status(404).json({ error: "Question not found" });
@@ -105,13 +143,11 @@ app.post("/api/questions/:id/replies", (req, res) => {
 
   const reply = { id: uuidv4(), text, createdAt: new Date().toISOString() };
   question.replies.push(reply);
-
   broadcast({ type: "new-reply", payload: { questionId: question.id, reply } });
-
   res.json(reply);
 });
 
-// Delete a reply (admin only)
+// ---- Delete reply (admin) ----
 app.delete("/api/questions/:id/replies/:rid", requireAdmin, (req, res) => {
   const question = questions.find((q) => q.id === req.params.id);
   if (!question) return res.status(404).json({ error: "Question not found" });
@@ -120,60 +156,27 @@ app.delete("/api/questions/:id/replies/:rid", requireAdmin, (req, res) => {
   if (idx === -1) return res.status(404).json({ error: "Reply not found" });
 
   const [deleted] = question.replies.splice(idx, 1);
-
-  broadcast({
-    type: "delete-reply",
-    payload: { questionId: question.id, replyId: deleted.id },
-  });
-
+  broadcast({ type: "delete-reply", payload: { questionId: question.id, replyId: deleted.id } });
   res.json({ success: true });
 });
 
-// Delete a question (admin only)
+// ---- Delete question (admin) ----
 app.delete("/api/questions/:id", requireAdmin, (req, res) => {
   const index = questions.findIndex((q) => q.id === req.params.id);
   if (index === -1) return res.status(404).json({ error: "Not found" });
-
   const deleted = questions.splice(index, 1)[0];
-
   broadcast({ type: "delete-question", payload: { id: deleted.id } });
-
   res.json({ success: true });
 });
 
-// Clear all questions (admin only)
+// ---- Clear all (admin) ----
 app.delete("/api/questions", requireAdmin, (req, res) => {
   questions = [];
   broadcast({ type: "clear-all" });
   res.json({ success: true });
 });
 
-// ---- Members endpoints ----
-
-// Anyone can see just count
-app.get("/api/members/count", (req, res) => {
-  res.json({ totalMembers: connections.size });
-});
-
-// Admin can see details
-app.get("/api/admin/members", requireAdmin, (req, res) => {
-  res.json({
-    totalMembers: connections.size,
-    members: Array.from(connections).map((c) => ({ id: c.id })),
-  });
-});
-
-// ---- Broadcast helper ----
-function broadcast(message) {
-  const data = JSON.stringify(message);
-  connections.forEach((conn) => {
-    try {
-      conn.write(data);
-    } catch {}
-  });
-}
-
-// start server
+// ---- start ----
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log(`🚀 Backend on http://localhost:${PORT}`);
 });
