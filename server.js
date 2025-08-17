@@ -15,19 +15,22 @@ const JWT_SECRET = "santanu@2006"; // keep safe!
 const ADMIN_USERNAME = "admin";
 const ADMIN_PASSWORD = "santanu@2006";
 
-// middleware
 app.use(cors());
 app.use(bodyParser.json());
 
-// in-memory stores
+// In-memory stores
 let questions = []; // {id, text, createdAt, replies:[{id,text,createdAt}]}
 let adminSessions = new Set();
 let connections = new Set();
 
-// 🔧 Maintenance mode (global)
+// 🔧 Maintenance state
 let maintenanceMode = false;
+let maintenanceMessage = "Server under maintenance. Please try again later.";
+let maintenanceLogoUrl = ""; // optional
+let maintenanceUntil = null; // ISO string or null
+let maintenanceTimer = null;
 
-// ---- helpers ----
+// ---- Helpers ----
 function broadcast(message) {
   const data = JSON.stringify(message);
   connections.forEach((conn) => {
@@ -51,13 +54,75 @@ function requireAdmin(req, res, next) {
   }
 }
 
+function setMaintenance({ status, message, logoUrl, durationMinutes }) {
+  // Clear previous timer
+  if (maintenanceTimer) {
+    clearTimeout(maintenanceTimer);
+    maintenanceTimer = null;
+  }
+
+  maintenanceMode = !!status;
+  if (typeof message === "string" && message.trim()) {
+    maintenanceMessage = message.trim();
+  }
+  if (typeof logoUrl === "string") {
+    maintenanceLogoUrl = logoUrl.trim();
+  }
+
+  if (maintenanceMode) {
+    // Optional timer
+    if (typeof durationMinutes === "number" && durationMinutes > 0) {
+      const ms = Math.floor(durationMinutes * 60 * 1000);
+      const until = new Date(Date.now() + ms);
+      maintenanceUntil = until.toISOString();
+      maintenanceTimer = setTimeout(() => {
+        maintenanceMode = false;
+        maintenanceUntil = null;
+        maintenanceTimer = null;
+        broadcast({
+          type: "maintenance",
+          payload: currentMaintenancePayload()
+        });
+      }, ms);
+    } else {
+      maintenanceUntil = null; // on until manually disabled
+    }
+
+    // Kick everyone with a notice first
+    const notice = JSON.stringify({
+      type: "maintenance",
+      payload: currentMaintenancePayload()
+    });
+    connections.forEach((conn) => {
+      try { conn.write(notice); } catch {}
+      try { conn.close(); } catch {}
+    });
+    connections.clear();
+  } else {
+    // Turning off
+    maintenanceUntil = null;
+  }
+
+  // Broadcast state (for clients who reconnect/admin panel)
+  broadcast({ type: "maintenance", payload: currentMaintenancePayload() });
+}
+
+function currentMaintenancePayload() {
+  return {
+    status: maintenanceMode,
+    message: maintenanceMessage,
+    logoUrl: maintenanceLogoUrl,
+    until: maintenanceUntil // could be null
+  };
+}
+
 // ---- SockJS ----
 sockServer.on("connection", (conn) => {
   connections.add(conn);
   conn.id = uuidv4(); // member id
 
-  // send current maintenance state immediately
-  conn.write(JSON.stringify({ type: "maintenance", payload: { status: maintenanceMode }}));
+  // Send current maintenance state immediately
+  conn.write(JSON.stringify({ type: "maintenance", payload: currentMaintenancePayload() }));
 
   conn.on("close", () => {
     connections.delete(conn);
@@ -81,19 +146,24 @@ app.post("/api/admin/login", (req, res) => {
 
 // ---- Maintenance endpoints (admin only) ----
 app.get("/api/admin/maintenance", requireAdmin, (req, res) => {
-  res.json({ status: maintenanceMode });
+  res.json(currentMaintenancePayload());
 });
 
 app.post("/api/admin/maintenance", requireAdmin, (req, res) => {
-  const { status } = req.body;
+  // Body: { status:boolean, message?:string, logoUrl?:string, durationMinutes?:number }
+  const { status, message, logoUrl, durationMinutes } = req.body || {};
   if (typeof status !== "boolean") {
     return res.status(400).json({ error: "status must be boolean" });
   }
-  maintenanceMode = status;
+  if (
+    durationMinutes !== undefined &&
+    !(typeof durationMinutes === "number" && durationMinutes >= 0)
+  ) {
+    return res.status(400).json({ error: "durationMinutes must be a non-negative number" });
+  }
 
-  // broadcast to all clients
-  broadcast({ type: "maintenance", payload: { status: maintenanceMode } });
-  res.json({ status: maintenanceMode });
+  setMaintenance({ status, message, logoUrl, durationMinutes });
+  res.json(currentMaintenancePayload());
 });
 
 // ---- Members endpoints ----
@@ -115,7 +185,7 @@ app.get("/api/questions", (req, res) => {
 
 app.post("/api/questions", (req, res) => {
   if (maintenanceMode) {
-    return res.status(503).json({ error: "Server under maintenance" });
+    return res.status(503).json({ error: "Server under maintenance", ...currentMaintenancePayload() });
   }
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: "Text is required" });
@@ -134,7 +204,7 @@ app.post("/api/questions", (req, res) => {
 // ---- Replies ----
 app.post("/api/questions/:id/replies", (req, res) => {
   if (maintenanceMode) {
-    return res.status(503).json({ error: "Server under maintenance" });
+    return res.status(503).json({ error: "Server under maintenance", ...currentMaintenancePayload() });
   }
   const { text } = req.body;
   const question = questions.find((q) => q.id === req.params.id);
