@@ -1,144 +1,155 @@
-// backend/server.js
-const express = require("express");
-const http = require("http");
-const cors = require("cors");
-const { v4: uuidv4 } = require("uuid");
-const SockJS = require("sockjs");
-
-const PORT = process.env.PORT || 3001;
-const ADMIN_SECRET = process.env.ADMIN_SECRET || "santanu@2006"; // ⚠️ better: set in Railway env var
+import express from "express";
+import cors from "cors";
+import { v4 as uuidv4 } from "uuid";
+import jwt from "jsonwebtoken";
+import bodyParser from "body-parser";
+import { createServer } from "http";
+import sockjs from "sockjs";
 
 const app = express();
-app.use(cors({ origin: "*" }));
-app.use(express.json());
+const server = createServer(app);
+const sockServer = sockjs.createServer();
 
-// In-memory data store
-const db = {
-  questions: [] // { id, text, createdAt, replies: [{ id, text, createdAt }] }
-};
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = "santanu@2006"; // secret for signing JWT tokens
+const ADMIN_USERNAME = "admin";
+const ADMIN_PASSWORD = "admin123";
 
-// ---- Health check
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", time: new Date().toISOString() });
-});
+// middleware
+app.use(cors());
+app.use(bodyParser.json());
 
-// ---- Public REST ----
-app.get("/api/questions", (req, res) => {
-  const list = [...db.questions].sort((a, b) => b.createdAt - a.createdAt);
-  res.json(list);
-});
+// in-memory stores
+let questions = [];
+let adminSessions = new Set();
+let connections = new Set();
 
-app.post("/api/questions", (req, res) => {
-  const text = (req.body && String(req.body.text || "").trim());
-  if (!text) return res.status(400).json({ error: "Text is required" });
-
-  const q = { id: uuidv4(), text, createdAt: Date.now(), replies: [] };
-  db.questions.push(q);
-
-  broadcast({ type: "question_created", payload: q });
-  res.status(201).json(q);
-});
-
-app.post("/api/questions/:id/replies", (req, res) => {
-  const q = db.questions.find(x => x.id === req.params.id);
-  if (!q) return res.status(404).json({ error: "Question not found" });
-
-  const text = (req.body && String(req.body.text || "").trim());
-  if (!text) return res.status(400).json({ error: "Text is required" });
-
-  const r = { id: uuidv4(), text, createdAt: Date.now() };
-  q.replies.push(r);
-
-  broadcast({ type: "reply_added", payload: { questionId: q.id, reply: r } });
-  res.status(201).json(r);
-});
-
-// ---- Admin auth ----
-const adminSessions = new Set();
-
-app.post("/api/admin/login", (req, res) => {
-  const { password } = req.body || {};
-  if (!ADMIN_SECRET) {
-    return res.status(500).json({ error: "ADMIN_SECRET not set on server" });
-  }
-  if (password !== ADMIN_SECRET) {
-    return res.status(401).json({ error: "Invalid password" });
-  }
-
-  const token = uuidv4();
-  adminSessions.add(token);
-  res.json({ token });
-});
-
+// JWT middleware for admin routes
 function requireAdmin(req, res, next) {
-  const auth = req.headers.authorization || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!token || !adminSessions.has(token)) {
-    return res.status(401).json({ error: "Unauthorized" });
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!adminSessions.has(decoded.sessionId)) {
+      return res.status(401).json({ error: "Invalid session" });
+    }
+    req.admin = decoded;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: "Invalid token" });
   }
-  next();
 }
 
-// ---- Admin-only actions ----
-
-// Delete a question
-app.delete("/api/questions/:id", requireAdmin, (req, res) => {
-  const idx = db.questions.findIndex(q => q.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: "Question not found" });
-
-  const [removed] = db.questions.splice(idx, 1);
-  broadcast({ type: "question_deleted", payload: { id: removed.id } });
-
-  res.json({ ok: true });
-});
-
-// Delete a reply
-app.delete("/api/questions/:id/replies/:rid", requireAdmin, (req, res) => {
-  const q = db.questions.find(x => x.id === req.params.id);
-  if (!q) return res.status(404).json({ error: "Question not found" });
-
-  const rIdx = q.replies.findIndex(r => r.id === req.params.rid);
-  if (rIdx === -1) return res.status(404).json({ error: "Reply not found" });
-
-  const [removed] = q.replies.splice(rIdx, 1);
-  broadcast({
-    type: "reply_deleted",
-    payload: { questionId: q.id, replyId: removed.id }
-  });
-
-  res.json({ ok: true });
-});
-
-// Clear all
-app.post("/api/admin/clear", requireAdmin, (req, res) => {
-  db.questions = [];
-  broadcast({ type: "cleared" });
-  res.json({ ok: true });
-});
-
-// ---- SockJS realtime hub ----
-const sockServer = SockJS.createServer({ prefix: "/ws" });
-const connections = new Set();
-
+// ---- SockJS setup ----
 sockServer.on("connection", (conn) => {
   connections.add(conn);
-  conn.write(JSON.stringify({ type: "connected", payload: { message: "Welcome" } }));
-  conn.on("close", () => connections.delete(conn));
+  conn.id = uuidv4(); // assign unique ID to each member
+
+  conn.on("data", (msg) => {
+    // here you could process messages if needed
+  });
+
+  conn.on("close", () => {
+    connections.delete(conn);
+  });
 });
 
+sockServer.installHandlers(server, { prefix: "/ws" });
+
+// ---- API Routes ----
+
+// Admin login
+app.post("/api/admin/login", (req, res) => {
+  const { username, password } = req.body;
+  if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
+    const sessionId = uuidv4();
+    adminSessions.add(sessionId);
+    const token = jwt.sign({ username, sessionId }, JWT_SECRET, {
+      expiresIn: "1h",
+    });
+    res.json({ token });
+  } else {
+    res.status(401).json({ error: "Invalid credentials" });
+  }
+});
+
+// Get all questions
+app.get("/api/questions", (req, res) => {
+  res.json(questions);
+});
+
+// Add a new question
+app.post("/api/questions", (req, res) => {
+  const { text } = req.body;
+  if (!text) return res.status(400).json({ error: "Text is required" });
+
+  const newQuestion = { id: uuidv4(), text, replies: [] };
+  questions.push(newQuestion);
+
+  // broadcast to all connections
+  broadcast({ type: "new-question", payload: newQuestion });
+
+  res.json(newQuestion);
+});
+
+// Add a reply
+app.post("/api/questions/:id/replies", (req, res) => {
+  const { text } = req.body;
+  const question = questions.find((q) => q.id === req.params.id);
+  if (!question) return res.status(404).json({ error: "Question not found" });
+
+  const reply = { id: uuidv4(), text };
+  question.replies.push(reply);
+
+  broadcast({ type: "new-reply", payload: { questionId: question.id, reply } });
+
+  res.json(reply);
+});
+
+// Delete a question (admin only)
+app.delete("/api/questions/:id", requireAdmin, (req, res) => {
+  const index = questions.findIndex((q) => q.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: "Not found" });
+
+  const deleted = questions.splice(index, 1)[0];
+
+  broadcast({ type: "delete-question", payload: { id: deleted.id } });
+
+  res.json({ success: true });
+});
+
+// Clear all questions (admin only)
+app.delete("/api/questions", requireAdmin, (req, res) => {
+  questions = [];
+  broadcast({ type: "clear-all" });
+  res.json({ success: true });
+});
+
+// ---- Members endpoints ----
+
+// Anyone can see just count
+app.get("/api/members/count", (req, res) => {
+  res.json({ totalMembers: connections.size });
+});
+
+// Admin can see details
+app.get("/api/admin/members", requireAdmin, (req, res) => {
+  res.json({
+    totalMembers: connections.size,
+    members: Array.from(connections).map((c) => ({ id: c.id })),
+  });
+});
+
+// ---- Broadcast helper ----
 function broadcast(message) {
   const data = JSON.stringify(message);
-  for (const c of connections) {
-    try {
-      c.write(data);
-    } catch {}
-  }
+  connections.forEach((conn) => {
+    conn.write(data);
+  });
 }
 
-const server = http.createServer(app);
-sockServer.installHandlers(server);
-
+// start server
 server.listen(PORT, () => {
-  console.log(`✅ Backend running on port ${PORT}`);
-  console.log(`➡ SockJS endpoint: /ws`);
+  console.log(`Server running on http://localhost:${PORT}`);
 });
