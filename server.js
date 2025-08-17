@@ -13,7 +13,7 @@ const sockServer = sockjs.createServer();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = "santanu@2006"; // secret for signing JWT tokens
 const ADMIN_USERNAME = "admin";
-const ADMIN_PASSWORD = "admin123";
+const ADMIN_PASSWORD = "santanu@2006";
 
 // middleware
 app.use(cors());
