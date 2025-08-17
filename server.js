@@ -20,7 +20,7 @@ app.use(cors());
 app.use(bodyParser.json());
 
 // in-memory stores
-let questions = [];
+let questions = []; // {id, text, createdAt, replies:[{id,text,createdAt}]}
 let adminSessions = new Set();
 let connections = new Set();
 
@@ -46,9 +46,7 @@ sockServer.on("connection", (conn) => {
   connections.add(conn);
   conn.id = uuidv4(); // assign unique ID to each member
 
-  conn.on("data", (msg) => {
-    // here you could process messages if needed
-  });
+  conn.on("data", () => { /* no-op */ });
 
   conn.on("close", () => {
     connections.delete(conn);
@@ -59,7 +57,7 @@ sockServer.installHandlers(server, { prefix: "/ws" });
 
 // ---- API Routes ----
 
-// Admin login
+// Admin login (expects { username, password })
 app.post("/api/admin/login", (req, res) => {
   const { username, password } = req.body;
   if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
@@ -84,7 +82,12 @@ app.post("/api/questions", (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: "Text is required" });
 
-  const newQuestion = { id: uuidv4(), text, replies: [] };
+  const newQuestion = {
+    id: uuidv4(),
+    text,
+    createdAt: new Date().toISOString(),
+    replies: [],
+  };
   questions.push(newQuestion);
 
   // broadcast to all connections
@@ -98,13 +101,32 @@ app.post("/api/questions/:id/replies", (req, res) => {
   const { text } = req.body;
   const question = questions.find((q) => q.id === req.params.id);
   if (!question) return res.status(404).json({ error: "Question not found" });
+  if (!text) return res.status(400).json({ error: "Text is required" });
 
-  const reply = { id: uuidv4(), text };
+  const reply = { id: uuidv4(), text, createdAt: new Date().toISOString() };
   question.replies.push(reply);
 
   broadcast({ type: "new-reply", payload: { questionId: question.id, reply } });
 
   res.json(reply);
+});
+
+// Delete a reply (admin only)
+app.delete("/api/questions/:id/replies/:rid", requireAdmin, (req, res) => {
+  const question = questions.find((q) => q.id === req.params.id);
+  if (!question) return res.status(404).json({ error: "Question not found" });
+
+  const idx = question.replies.findIndex((r) => r.id === req.params.rid);
+  if (idx === -1) return res.status(404).json({ error: "Reply not found" });
+
+  const [deleted] = question.replies.splice(idx, 1);
+
+  broadcast({
+    type: "delete-reply",
+    payload: { questionId: question.id, replyId: deleted.id },
+  });
+
+  res.json({ success: true });
 });
 
 // Delete a question (admin only)
@@ -145,7 +167,9 @@ app.get("/api/admin/members", requireAdmin, (req, res) => {
 function broadcast(message) {
   const data = JSON.stringify(message);
   connections.forEach((conn) => {
-    conn.write(data);
+    try {
+      conn.write(data);
+    } catch {}
   });
 }
 
