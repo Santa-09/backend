@@ -11,39 +11,31 @@ const server = createServer(app);
 const sockServer = sockjs.createServer();
 
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = "santanu@2006"; // ⚠️ Keep safe & move to ENV in production!
+const JWT_SECRET = "santanu@2006"; // keep safe!
 const ADMIN_USERNAME = "admin";
 const ADMIN_PASSWORD = "santanu@2006";
 
 app.use(cors());
 app.use(bodyParser.json());
 
-// =======================
 // In-memory stores
-// =======================
-let questions = []; 
-// structure: {id, text, createdAt, replies:[{id,text,createdAt}]}
-
+let questions = []; // {id, text, createdAt, replies:[{id,text,createdAt}]}
 let adminSessions = new Set();
-let connections = new Set();
+let connections = new Map(); // {conn -> {id, username}}
 
-// =======================
-// Maintenance Mode State
-// =======================
+// 🔧 Maintenance state
 let maintenanceMode = false;
 let maintenanceMessage = "Server under maintenance. Please try again later.";
 let maintenanceLogoUrl = "";
 let maintenanceUntil = null;
 let maintenanceTimer = null;
 
-// =======================
-// Helpers
-// =======================
+// ---- Helpers ----
 function broadcast(message) {
   const data = JSON.stringify(message);
-  connections.forEach((conn) => {
+  for (const conn of connections.keys()) {
     try { conn.write(data); } catch {}
-  });
+  }
 }
 
 function requireAdmin(req, res, next) {
@@ -60,15 +52,6 @@ function requireAdmin(req, res, next) {
   } catch {
     res.status(401).json({ error: "Invalid token" });
   }
-}
-
-function currentMaintenancePayload() {
-  return {
-    status: maintenanceMode,
-    message: maintenanceMessage,
-    logoUrl: maintenanceLogoUrl,
-    until: maintenanceUntil
-  };
 }
 
 function setMaintenance({ status, message, logoUrl, durationMinutes }) {
@@ -100,15 +83,14 @@ function setMaintenance({ status, message, logoUrl, durationMinutes }) {
       maintenanceUntil = null;
     }
 
-    // Notify + kick connections
     const notice = JSON.stringify({
       type: "maintenance",
       payload: currentMaintenancePayload()
     });
-    connections.forEach((conn) => {
+    for (const conn of connections.keys()) {
       try { conn.write(notice); } catch {}
       try { conn.close(); } catch {}
-    });
+    }
     connections.clear();
   } else {
     maintenanceUntil = null;
@@ -117,39 +99,55 @@ function setMaintenance({ status, message, logoUrl, durationMinutes }) {
   broadcast({ type: "maintenance", payload: currentMaintenancePayload() });
 }
 
-// =======================
-// SockJS WebSocket
-// =======================
-sockServer.on("connection", (conn) => {
-  connections.add(conn);
-  conn.id = uuidv4();
+function currentMaintenancePayload() {
+  return {
+    status: maintenanceMode,
+    message: maintenanceMessage,
+    logoUrl: maintenanceLogoUrl,
+    until: maintenanceUntil
+  };
+}
 
-  // Immediately send maintenance state
+// ---- SockJS ----
+sockServer.on("connection", (conn) => {
+  const member = { id: uuidv4(), username: null };
+  connections.set(conn, member);
+
+  // Send current maintenance state
   conn.write(JSON.stringify({ type: "maintenance", payload: currentMaintenancePayload() }));
+
+  conn.on("data", (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      if (data.type === "set-username") {
+        member.username = data.username || "Guest";
+        broadcast({ type: "user-joined", payload: member });
+      }
+    } catch (e) {}
+  });
 
   conn.on("close", () => {
     connections.delete(conn);
+    broadcast({ type: "user-left", payload: member });
   });
 });
+
 sockServer.installHandlers(server, { prefix: "/ws" });
 
-// =======================
-// Admin Authentication
-// =======================
+// ---- Admin auth ----
 app.post("/api/admin/login", (req, res) => {
   const { username, password } = req.body;
   if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
     const sessionId = uuidv4();
     adminSessions.add(sessionId);
     const token = jwt.sign({ username, sessionId }, JWT_SECRET, { expiresIn: "1h" });
-    return res.json({ token });
+    res.json({ token });
+  } else {
+    res.status(401).json({ error: "Invalid credentials" });
   }
-  return res.status(401).json({ error: "Invalid credentials" });
 });
 
-// =======================
-// Maintenance Endpoints
-// =======================
+// ---- Maintenance endpoints (admin only) ----
 app.get("/api/admin/maintenance", requireAdmin, (req, res) => {
   res.json(currentMaintenancePayload());
 });
@@ -159,20 +157,15 @@ app.post("/api/admin/maintenance", requireAdmin, (req, res) => {
   if (typeof status !== "boolean") {
     return res.status(400).json({ error: "status must be boolean" });
   }
-  if (
-    durationMinutes !== undefined &&
-    !(typeof durationMinutes === "number" && durationMinutes >= 0)
-  ) {
-    return res.status(400).json({ error: "durationMinutes must be a non-negative number" });
+  if (durationMinutes !== undefined && !(typeof durationMinutes === "number" && durationMinutes >= 0)) {
+    return res.status(400).json({ error: "durationMinutes must be non-negative number" });
   }
 
   setMaintenance({ status, message, logoUrl, durationMinutes });
   res.json(currentMaintenancePayload());
 });
 
-// =======================
-// Member Endpoints
-// =======================
+// ---- Members endpoints ----
 app.get("/api/members/count", (req, res) => {
   res.json({ totalMembers: connections.size });
 });
@@ -180,13 +173,11 @@ app.get("/api/members/count", (req, res) => {
 app.get("/api/admin/members", requireAdmin, (req, res) => {
   res.json({
     totalMembers: connections.size,
-    members: Array.from(connections).map((c) => ({ id: c.id }))
+    members: Array.from(connections.values()).map((m) => ({ id: m.id, username: m.username })),
   });
 });
 
-// =======================
-// Q&A Endpoints
-// =======================
+// ---- Questions ----
 app.get("/api/questions", (req, res) => {
   res.json(questions);
 });
@@ -202,13 +193,14 @@ app.post("/api/questions", (req, res) => {
     id: uuidv4(),
     text,
     createdAt: new Date().toISOString(),
-    replies: []
+    replies: [],
   };
   questions.push(newQuestion);
   broadcast({ type: "new-question", payload: newQuestion });
   res.json(newQuestion);
 });
 
+// ---- Replies ----
 app.post("/api/questions/:id/replies", (req, res) => {
   if (maintenanceMode) {
     return res.status(503).json({ error: "Server under maintenance", ...currentMaintenancePayload() });
@@ -224,7 +216,7 @@ app.post("/api/questions/:id/replies", (req, res) => {
   res.json(reply);
 });
 
-// Delete reply (admin only)
+// ---- Delete reply (admin) ----
 app.delete("/api/questions/:id/replies/:rid", requireAdmin, (req, res) => {
   const question = questions.find((q) => q.id === req.params.id);
   if (!question) return res.status(404).json({ error: "Question not found" });
@@ -237,26 +229,23 @@ app.delete("/api/questions/:id/replies/:rid", requireAdmin, (req, res) => {
   res.json({ success: true });
 });
 
-// Delete question (admin only)
+// ---- Delete question (admin) ----
 app.delete("/api/questions/:id", requireAdmin, (req, res) => {
   const index = questions.findIndex((q) => q.id === req.params.id);
   if (index === -1) return res.status(404).json({ error: "Not found" });
-
   const deleted = questions.splice(index, 1)[0];
   broadcast({ type: "delete-question", payload: { id: deleted.id } });
   res.json({ success: true });
 });
 
-// Clear all (admin only)
+// ---- Clear all (admin) ----
 app.delete("/api/questions", requireAdmin, (req, res) => {
   questions = [];
   broadcast({ type: "clear-all" });
   res.json({ success: true });
 });
 
-// =======================
-// Start Server
-// =======================
+// ---- start ----
 server.listen(PORT, () => {
-  console.log(`🚀 Backend running at http://localhost:${PORT}`);
+  console.log(`🚀 Backend running on http://localhost:${PORT}`);
 });
