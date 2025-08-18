@@ -5,15 +5,25 @@ import jwt from "jsonwebtoken";
 import bodyParser from "body-parser";
 import { createServer } from "http";
 import sockjs from "sockjs";
+import dotenv from "dotenv";
+import OpenAI from "openai";
+
+dotenv.config();
 
 const app = express();
 const server = createServer(app);
 const sockServer = sockjs.createServer();
 
+// --- Config / Secrets ---
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = "santanu@2006"; // keep safe!
-const ADMIN_USERNAME = "admin";
-const ADMIN_PASSWORD = "santanu@2006";
+const JWT_SECRET = process.env.JWT_SECRET || "santanu@2006"; // move to .env in prod
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "santanu@2006";
+
+// --- OpenAI Client (requires OPENAI_API_KEY in .env) ---
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
 app.use(cors());
 app.use(bodyParser.json());
@@ -98,10 +108,8 @@ sockServer.on("connection", (conn) => {
       const data = JSON.parse(msg);
       if (data.type === "set-username") {
         member.username = data.username || "Guest";
-        // optional: broadcast join/leave
         broadcast({ type: "user-joined", payload: { id: member.id, username: member.username } }, { exclude: conn });
       } else if (data.type === "typing") {
-        // Fan-out typing events to others
         const payload = {
           questionId: data.questionId || null,
           username: member.username || data.username || "Someone"
@@ -222,6 +230,47 @@ app.delete("/api/questions", requireAdmin, (req, res) => {
   questions = [];
   broadcast({ type: "clear-all" });
   res.json({ success: true });
+});
+
+// ---- AI endpoint: server-side AI reply to a question ----
+app.post("/api/ai", async (req, res) => {
+  if (maintenanceMode) {
+    return res.status(503).json({ error: "Server under maintenance", ...currentMaintenancePayload() });
+  }
+  const { questionId, prompt } = req.body || {};
+  if (!questionId || !prompt) return res.status(400).json({ error: "questionId and prompt are required" });
+
+  const question = questions.find((q) => q.id === questionId);
+  if (!question) return res.status(404).json({ error: "Question not found" });
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You are a concise, friendly classroom assistant. Be clear, safe, and helpful." },
+        { role: "user", content: prompt }
+      ],
+      temperature: 0.7
+    });
+
+    const text =
+      completion?.choices?.[0]?.message?.content?.trim() ||
+      "Sorry, I couldn’t generate a reply right now.";
+
+    const reply = {
+      id: uuidv4(),
+      text,
+      createdAt: new Date().toISOString(),
+      user: "AI Assistant"
+    };
+
+    question.replies.push(reply);
+    broadcast({ type: "new-reply", payload: { questionId: question.id, reply } });
+    res.json(reply);
+  } catch (err) {
+    console.error("AI error:", err);
+    res.status(500).json({ error: "AI request failed" });
+  }
 });
 
 // ---- start ----
