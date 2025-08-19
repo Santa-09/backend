@@ -27,9 +27,9 @@ app.use(cors());
 app.use(bodyParser.json());
 
 // ---- In-memory stores ----
-let questions = []; // {id, text, user, createdAt, replies:[{id,text,user,createdAt}]}
+let questions = [];
 let adminSessions = new Set();
-let connections = new Map(); // Map<conn, {id, username}>
+let connections = new Map();
 
 // 🔧 Maintenance state
 let maintenanceMode = false;
@@ -42,7 +42,9 @@ let maintenanceTimer = null;
 function broadcast(message) {
   const data = JSON.stringify(message);
   for (const conn of connections.keys()) {
-    try { conn.write(data); } catch {}
+    try {
+      conn.write(data);
+    } catch {}
   }
 }
 
@@ -67,7 +69,7 @@ function currentMaintenancePayload() {
     status: maintenanceMode,
     message: maintenanceMessage,
     logoUrl: maintenanceLogoUrl,
-    until: maintenanceUntil
+    until: maintenanceUntil,
   };
 }
 
@@ -95,11 +97,14 @@ function setMaintenance({ status, message, logoUrl, durationMinutes }) {
       maintenanceUntil = null;
     }
 
-    // Notify + disconnect everyone
     const notice = JSON.stringify({ type: "maintenance", payload: currentMaintenancePayload() });
     for (const conn of connections.keys()) {
-      try { conn.write(notice); } catch {}
-      try { conn.close(); } catch {}
+      try {
+        conn.write(notice);
+      } catch {}
+      try {
+        conn.close();
+      } catch {}
     }
     connections.clear();
   } else {
@@ -119,13 +124,15 @@ async function generateAIReply(prompt) {
         {
           role: "system",
           content:
-            "You are a friendly teaching assistant. Answer clearly in 2–5 short sentences. If the question is vague, give a helpful next step."
+            "You are a friendly teaching assistant. Answer clearly in 2–5 short sentences. If the question is vague, give a helpful next step.",
         },
-        { role: "user", content: prompt }
+        { role: "user", content: prompt },
       ],
-      temperature: 0.3
+      temperature: 0.3,
     });
-    const text = resp.choices?.[0]?.message?.content?.trim() || "I’m here! Ask me again with a bit more detail.";
+    const text =
+      resp.choices?.[0]?.message?.content?.trim() ||
+      "I’m here! Ask me again with a bit more detail.";
     return text;
   } catch (e) {
     console.error("OpenAI error:", e?.message || e);
@@ -138,7 +145,6 @@ sockServer.on("connection", (conn) => {
   const member = { id: uuidv4(), username: null };
   connections.set(conn, member);
 
-  // Send current maintenance state on connect
   conn.write(JSON.stringify({ type: "maintenance", payload: currentMaintenancePayload() }));
 
   conn.on("data", (msg) => {
@@ -157,7 +163,8 @@ sockServer.on("connection", (conn) => {
   });
 });
 
-sockServer.installHandlers(server, { prefix: "/ws" });
+// ⚠️ FIXED: add trailing slash so frontend matches
+sockServer.installHandlers(server, { prefix: "/ws/" });
 
 // ---- Admin auth ----
 app.post("/api/admin/login", (req, res) => {
@@ -172,14 +179,17 @@ app.post("/api/admin/login", (req, res) => {
   }
 });
 
-// ---- Maintenance endpoints (admin only) ----
+// ---- Maintenance endpoints ----
 app.get("/api/admin/maintenance", requireAdmin, (req, res) => {
   res.json(currentMaintenancePayload());
 });
 app.post("/api/admin/maintenance", requireAdmin, (req, res) => {
   const { status, message, logoUrl, durationMinutes } = req.body || {};
   if (typeof status !== "boolean") return res.status(400).json({ error: "status must be boolean" });
-  if (durationMinutes !== undefined && !(typeof durationMinutes === "number" && durationMinutes >= 0)) {
+  if (
+    durationMinutes !== undefined &&
+    !(typeof durationMinutes === "number" && durationMinutes >= 0)
+  ) {
     return res.status(400).json({ error: "durationMinutes must be non-negative number" });
   }
   setMaintenance({ status, message, logoUrl, durationMinutes });
@@ -204,10 +214,13 @@ app.get("/api/questions", (req, res) => {
 
 app.post("/api/questions", async (req, res) => {
   if (maintenanceMode) {
-    return res.status(503).json({ error: "Server under maintenance", ...currentMaintenancePayload() });
+    return res
+      .status(503)
+      .json({ error: "Server under maintenance", ...currentMaintenancePayload() });
   }
   const { text, user, ai } = req.body || {};
-  if (!text || typeof text !== "string") return res.status(400).json({ error: "Text is required" });
+  if (!text || typeof text !== "string")
+    return res.status(400).json({ error: "Text is required" });
 
   const newQuestion = {
     id: uuidv4(),
@@ -219,7 +232,6 @@ app.post("/api/questions", async (req, res) => {
   questions.push(newQuestion);
   broadcast({ type: "new-question", payload: newQuestion });
 
-  // Optional AI auto-answer
   if (ai === true) {
     const aiText = await generateAIReply(text);
     const reply = {
@@ -238,23 +250,25 @@ app.post("/api/questions", async (req, res) => {
 // ---- Replies ----
 app.post("/api/questions/:id/replies", async (req, res) => {
   if (maintenanceMode) {
-    return res.status(503).json({ error: "Server under maintenance", ...currentMaintenancePayload() });
+    return res
+      .status(503)
+      .json({ error: "Server under maintenance", ...currentMaintenancePayload() });
   }
   const { text, user, ai } = req.body || {};
   const question = questions.find((q) => q.id === req.params.id);
   if (!question) return res.status(404).json({ error: "Question not found" });
-  if (!text || typeof text !== "string") return res.status(400).json({ error: "Text is required" });
+  if (!text || typeof text !== "string")
+    return res.status(400).json({ error: "Text is required" });
 
   const reply = {
     id: uuidv4(),
     text: text.toString().slice(0, 2000),
     user: (user || "anonymous").toString().slice(0, 50),
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
   };
   question.replies.push(reply);
   broadcast({ type: "new-reply", payload: { questionId: question.id, reply } });
 
-  // Optional AI follow-up reply
   if (ai === true) {
     const aiText = await generateAIReply(text);
     const aiReply = {
