@@ -14,22 +14,20 @@ const app = express();
 const server = createServer(app);
 const sockServer = sockjs.createServer();
 
-// --- Config / Secrets ---
+// ---- Config / Secrets ----
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || "santanu@2006"; // move to .env in prod
+const JWT_SECRET = process.env.JWT_SECRET || "santanu@2006";
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "santanu@2006";
 
-// --- OpenAI Client (requires OPENAI_API_KEY in .env) ---
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+const openaiApiKey = process.env.OPENAI_API_KEY || "";
+const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
 
 app.use(cors());
 app.use(bodyParser.json());
 
-// In-memory stores
-let questions = []; // {id, text, createdAt, user, replies:[{id,text,createdAt,user}]}
+// ---- In-memory stores ----
+let questions = []; // {id, text, user, createdAt, replies:[{id,text,user,createdAt}]}
 let adminSessions = new Set();
 let connections = new Map(); // Map<conn, {id, username}>
 
@@ -41,30 +39,44 @@ let maintenanceUntil = null;
 let maintenanceTimer = null;
 
 // ---- Helpers ----
-function broadcast(message, { exclude } = {}) {
+function broadcast(message) {
   const data = JSON.stringify(message);
   for (const conn of connections.keys()) {
-    if (exclude && conn === exclude) continue;
     try { conn.write(data); } catch {}
   }
 }
-function currentMaintenancePayload() {
-  return { status: maintenanceMode, message: maintenanceMessage, logoUrl: maintenanceLogoUrl, until: maintenanceUntil };
-}
+
 function requireAdmin(req, res, next) {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ error: "Unauthorized" });
+
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    if (!adminSessions.has(decoded.sessionId)) return res.status(401).json({ error: "Invalid session" });
+    if (!adminSessions.has(decoded.sessionId)) {
+      return res.status(401).json({ error: "Invalid session" });
+    }
     req.admin = decoded;
     next();
   } catch {
     res.status(401).json({ error: "Invalid token" });
   }
 }
+
+function currentMaintenancePayload() {
+  return {
+    status: maintenanceMode,
+    message: maintenanceMessage,
+    logoUrl: maintenanceLogoUrl,
+    until: maintenanceUntil
+  };
+}
+
 function setMaintenance({ status, message, logoUrl, durationMinutes }) {
-  if (maintenanceTimer) { clearTimeout(maintenanceTimer); maintenanceTimer = null; }
+  if (maintenanceTimer) {
+    clearTimeout(maintenanceTimer);
+    maintenanceTimer = null;
+  }
+
   maintenanceMode = !!status;
   if (typeof message === "string" && message.trim()) maintenanceMessage = message.trim();
   if (typeof logoUrl === "string") maintenanceLogoUrl = logoUrl.trim();
@@ -83,6 +95,7 @@ function setMaintenance({ status, message, logoUrl, durationMinutes }) {
       maintenanceUntil = null;
     }
 
+    // Notify + disconnect everyone
     const notice = JSON.stringify({ type: "maintenance", payload: currentMaintenancePayload() });
     for (const conn of connections.keys()) {
       try { conn.write(notice); } catch {}
@@ -92,7 +105,32 @@ function setMaintenance({ status, message, logoUrl, durationMinutes }) {
   } else {
     maintenanceUntil = null;
   }
+
   broadcast({ type: "maintenance", payload: currentMaintenancePayload() });
+}
+
+// ---- AI helper ----
+async function generateAIReply(prompt) {
+  if (!openai) return "AI is not configured on the server.";
+  try {
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a friendly teaching assistant. Answer clearly in 2–5 short sentences. If the question is vague, give a helpful next step."
+        },
+        { role: "user", content: prompt }
+      ],
+      temperature: 0.3
+    });
+    const text = resp.choices?.[0]?.message?.content?.trim() || "I’m here! Ask me again with a bit more detail.";
+    return text;
+  } catch (e) {
+    console.error("OpenAI error:", e?.message || e);
+    return "Sorry, I couldn’t generate an answer right now.";
+  }
 }
 
 // ---- SockJS ----
@@ -100,35 +138,30 @@ sockServer.on("connection", (conn) => {
   const member = { id: uuidv4(), username: null };
   connections.set(conn, member);
 
-  // Send current maintenance state immediately
+  // Send current maintenance state on connect
   conn.write(JSON.stringify({ type: "maintenance", payload: currentMaintenancePayload() }));
 
   conn.on("data", (msg) => {
     try {
       const data = JSON.parse(msg);
       if (data.type === "set-username") {
-        member.username = data.username || "Guest";
-        broadcast({ type: "user-joined", payload: { id: member.id, username: member.username } }, { exclude: conn });
-      } else if (data.type === "typing") {
-        const payload = {
-          questionId: data.questionId || null,
-          username: member.username || data.username || "Someone"
-        };
-        broadcast({ type: "typing", payload }, { exclude: conn });
+        member.username = (data.username || "Guest").toString().slice(0, 50);
+        broadcast({ type: "user-joined", payload: { id: member.id, username: member.username } });
       }
     } catch {}
   });
 
   conn.on("close", () => {
     connections.delete(conn);
-    broadcast({ type: "user-left", payload: member });
+    broadcast({ type: "user-left", payload: { id: member.id, username: member.username } });
   });
 });
+
 sockServer.installHandlers(server, { prefix: "/ws" });
 
 // ---- Admin auth ----
 app.post("/api/admin/login", (req, res) => {
-  const { username, password } = req.body;
+  const { username, password } = req.body || {};
   if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
     const sessionId = uuidv4();
     adminSessions.add(sessionId);
@@ -168,38 +201,72 @@ app.get("/api/admin/members", requireAdmin, (req, res) => {
 app.get("/api/questions", (req, res) => {
   res.json(questions);
 });
-app.post("/api/questions", (req, res) => {
+
+app.post("/api/questions", async (req, res) => {
   if (maintenanceMode) {
     return res.status(503).json({ error: "Server under maintenance", ...currentMaintenancePayload() });
   }
-  const { text, user } = req.body;
-  if (!text) return res.status(400).json({ error: "Text is required" });
+  const { text, user, ai } = req.body || {};
+  if (!text || typeof text !== "string") return res.status(400).json({ error: "Text is required" });
 
   const newQuestion = {
     id: uuidv4(),
-    text,
+    text: text.toString().slice(0, 2000),
+    user: (user || "anonymous").toString().slice(0, 50),
     createdAt: new Date().toISOString(),
-    user: user || null,
     replies: [],
   };
   questions.push(newQuestion);
   broadcast({ type: "new-question", payload: newQuestion });
+
+  // Optional AI auto-answer
+  if (ai === true) {
+    const aiText = await generateAIReply(text);
+    const reply = {
+      id: uuidv4(),
+      text: aiText,
+      user: "AI Assistant",
+      createdAt: new Date().toISOString(),
+    };
+    newQuestion.replies.push(reply);
+    broadcast({ type: "new-reply", payload: { questionId: newQuestion.id, reply } });
+  }
+
   res.json(newQuestion);
 });
 
 // ---- Replies ----
-app.post("/api/questions/:id/replies", (req, res) => {
+app.post("/api/questions/:id/replies", async (req, res) => {
   if (maintenanceMode) {
     return res.status(503).json({ error: "Server under maintenance", ...currentMaintenancePayload() });
   }
-  const { text, user } = req.body;
+  const { text, user, ai } = req.body || {};
   const question = questions.find((q) => q.id === req.params.id);
   if (!question) return res.status(404).json({ error: "Question not found" });
-  if (!text) return res.status(400).json({ error: "Text is required" });
+  if (!text || typeof text !== "string") return res.status(400).json({ error: "Text is required" });
 
-  const reply = { id: uuidv4(), text, createdAt: new Date().toISOString(), user: user || null };
+  const reply = {
+    id: uuidv4(),
+    text: text.toString().slice(0, 2000),
+    user: (user || "anonymous").toString().slice(0, 50),
+    createdAt: new Date().toISOString()
+  };
   question.replies.push(reply);
   broadcast({ type: "new-reply", payload: { questionId: question.id, reply } });
+
+  // Optional AI follow-up reply
+  if (ai === true) {
+    const aiText = await generateAIReply(text);
+    const aiReply = {
+      id: uuidv4(),
+      text: aiText,
+      user: "AI Assistant",
+      createdAt: new Date().toISOString(),
+    };
+    question.replies.push(aiReply);
+    broadcast({ type: "new-reply", payload: { questionId: question.id, reply: aiReply } });
+  }
+
   res.json(reply);
 });
 
@@ -230,47 +297,6 @@ app.delete("/api/questions", requireAdmin, (req, res) => {
   questions = [];
   broadcast({ type: "clear-all" });
   res.json({ success: true });
-});
-
-// ---- AI endpoint: server-side AI reply to a question ----
-app.post("/api/ai", async (req, res) => {
-  if (maintenanceMode) {
-    return res.status(503).json({ error: "Server under maintenance", ...currentMaintenancePayload() });
-  }
-  const { questionId, prompt } = req.body || {};
-  if (!questionId || !prompt) return res.status(400).json({ error: "questionId and prompt are required" });
-
-  const question = questions.find((q) => q.id === questionId);
-  if (!question) return res.status(404).json({ error: "Question not found" });
-
-  try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "You are a concise, friendly classroom assistant. Be clear, safe, and helpful." },
-        { role: "user", content: prompt }
-      ],
-      temperature: 0.7
-    });
-
-    const text =
-      completion?.choices?.[0]?.message?.content?.trim() ||
-      "Sorry, I couldn’t generate a reply right now.";
-
-    const reply = {
-      id: uuidv4(),
-      text,
-      createdAt: new Date().toISOString(),
-      user: "AI Assistant"
-    };
-
-    question.replies.push(reply);
-    broadcast({ type: "new-reply", payload: { questionId: question.id, reply } });
-    res.json(reply);
-  } catch (err) {
-    console.error("AI error:", err);
-    res.status(500).json({ error: "AI request failed" });
-  }
 });
 
 // ---- start ----
