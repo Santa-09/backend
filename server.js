@@ -92,7 +92,7 @@ async function generateAIReply(prompt) {
   }
 
   // models to try in order
-  const models = ["gpt-4o-mini", "gpt-3.5-turbo"];
+  const models = ["gpt-4o-mini", "gpt-4o"];
 
   for (const model of models) {
     try {
