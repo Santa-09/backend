@@ -15,7 +15,7 @@ const server = createServer(app);
 const sockServer = sockjs.createServer();
 
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || "change-me"; // FIX: safer default
+const JWT_SECRET = process.env.JWT_SECRET || "change-me";
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin";
 
@@ -26,7 +26,7 @@ const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
 // ---- Middleware ----
 app.use(cors({
   origin: [
-    /localhost:\\d+$/, // allow any localhost port
+    /localhost:\d+$/,            // any localhost port
     "http://localhost:3000",
     "http://localhost:5000",
     "https://frontend-ten-tan-10.vercel.app",
@@ -86,7 +86,10 @@ function currentMaintenancePayload() {
 
 // ---- AI helper ----
 async function generateAIReply(prompt) {
-  if (!openai) return "⚠️ AI is not configured on the server.";
+  if (!openai) {
+    console.warn("OPENAI_API_KEY missing; AI disabled.");
+    return "⚠️ AI is not configured on the server.";
+  }
   try {
     const resp = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -127,8 +130,8 @@ sockServer.on("connection", (conn) => {
   });
 });
 
-// Important: prefix WITHOUT needing any extra client slash
-sockServer.installHandlers(server, { prefix: "/ws" }); // FIX: "/ws" not "/ws/"
+// Prefix without trailing slash
+sockServer.installHandlers(server, { prefix: "/ws" });
 
 // ---- Admin login ----
 app.post("/api/admin/login", (req, res) => {
@@ -143,14 +146,14 @@ app.post("/api/admin/login", (req, res) => {
   }
 });
 
-// ---- Admin: members list (NEW) ----
+// ---- Admin: members list ----
 app.get("/api/admin/members", requireAdmin, (req, res) => {
   const list = [];
   for (const [, m] of connections) list.push({ username: m.username || "Guest", online: true });
   res.json(list);
 });
 
-// ---- Admin: maintenance (NEW) ----
+// ---- Admin: maintenance ----
 app.get("/api/admin/maintenance", requireAdmin, (req, res) => {
   res.json(currentMaintenancePayload());
 });
@@ -160,7 +163,7 @@ app.put("/api/admin/maintenance", requireAdmin, (req, res) => {
   maintenanceMode = !!status;
   if (typeof message === "string") maintenanceMessage = message.slice(0, 300);
   if (typeof logoUrl === "string") maintenanceLogoUrl = logoUrl.slice(0, 500);
-  maintenanceUntil = until || null; // ISO or null
+  maintenanceUntil = until || null;
 
   const payload = currentMaintenancePayload();
   broadcast({ type: "maintenance", payload });
@@ -177,7 +180,7 @@ app.delete("/api/admin/maintenance", requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-// ---- Admin: clear all (NEW) ----
+// ---- Admin: clear all ----
 app.delete("/api/admin/clear-all", requireAdmin, (req, res) => {
   questions = [];
   broadcast({ type: "clear-all" });
@@ -241,7 +244,7 @@ app.post("/api/questions/:id/replies", async (req, res) => {
   res.json(reply);
 });
 
-// ---- Delete endpoints (NEW to match frontend) ----
+// ---- Delete endpoints ----
 app.delete("/api/questions/:id", requireAdmin, (req, res) => {
   const { id } = req.params;
   const idx = questions.findIndex((q) => q.id === id);
