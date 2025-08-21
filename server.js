@@ -92,7 +92,7 @@ async function generateAIReply(prompt) {
   }
   try {
     const resp = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-3.5-turbo",
       messages: [
         { role: "system", content: "You are a friendly assistant. Answer clearly in 2–5 short sentences." },
         { role: "user", content: prompt }
