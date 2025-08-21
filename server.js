@@ -92,8 +92,7 @@ async function generateAIReply(prompt) {
   }
 
   // models to try in order
-  const models = "gpt-4o";
-
+const models = ["gpt-4o-mini", "gpt-4o"];
   for (const model of models) {
     try {
       const resp = await openai.chat.completions.create({
