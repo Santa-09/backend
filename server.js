@@ -90,21 +90,33 @@ async function generateAIReply(prompt) {
     console.warn("OPENAI_API_KEY missing; AI disabled.");
     return "⚠️ AI is not configured on the server.";
   }
-  try {
-    const resp = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo",
-      messages: [
-        { role: "system", content: "You are a friendly assistant. Answer clearly in 2–5 short sentences." },
-        { role: "user", content: prompt }
-      ],
-      temperature: 0.3
-    });
-    return resp.choices?.[0]?.message?.content?.trim() || "I couldn’t generate an answer.";
-  } catch (err) {
-    console.error("OpenAI error:", err?.response?.data || err.message || err);
-    return "Sorry, I couldn’t generate an answer right now.";
+
+  // models to try in order
+  const models = ["gpt-4o-mini", "gpt-3.5-turbo"];
+
+  for (const model of models) {
+    try {
+      const resp = await openai.chat.completions.create({
+        model,
+        messages: [
+          { role: "system", content: "You are a friendly assistant. Answer clearly in 2–5 short sentences." },
+          { role: "user", content: prompt }
+        ],
+        temperature: 0.3,
+      });
+      const text = resp.choices?.[0]?.message?.content?.trim();
+      if (text) {
+        console.log(`✅ Reply generated with model: ${model}`);
+        return text;
+      }
+    } catch (err) {
+      console.error(`❌ Error with ${model}:`, err?.response?.data || err.message || err);
+    }
   }
+
+  return "⚠️ Sorry, I couldn’t generate an answer right now.";
 }
+
 
 // ---- SockJS ----
 sockServer.on("connection", (conn) => {
